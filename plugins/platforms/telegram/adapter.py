@@ -6934,7 +6934,7 @@ class TelegramAdapter(BasePlatformAdapter):
                             for row in group_providers(
                                 [p.get("slug") for p in state["providers"]]
                             )
-                            if row.get("group_id") == "local"
+                            if row.get("group_id") == group_id
                         ),
                         None,
                     )

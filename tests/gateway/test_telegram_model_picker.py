@@ -144,3 +144,59 @@ class TestTelegramModelPicker:
                 "label": "Qwen 3.8 27B CRACK",
             }
         ]
+
+    @pytest.mark.asyncio
+    async def test_non_local_folder_drills_to_its_own_models_not_local(self, tmp_path, monkeypatch):
+        """Regression test for 2026-08-18: the mpg: handler's local_row lookup
+        was hardcoded to `group_id == "local"` instead of the tapped
+        `group_id`, so EVERY curated folder (z.AI, xAI, Moonshot, ...) showed
+        the Local folder's model list instead of its own. With two folders
+        present in state["providers"], tapping the non-local one must return
+        that folder's models, not Local's.
+        """
+        (tmp_path / "config.yaml").write_text(
+            "providers:\n"
+            "  qwen38-27b-crack-q8:\n"
+            "    name: Qwen 3.8 27B CRACK\n"
+            "    base_url: http://127.0.0.1:8187/v1\n"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        adapter = _make_adapter()
+        adapter._model_picker_state["12345"] = {
+            "providers": [
+                {
+                    "slug": "custom:qwen38-27b-crack-q8",
+                    "name": "Qwen 3.8 27B CRACK",
+                    "models": ["qwen38-27b-crack-q8"],
+                    "total_models": 1,
+                    "is_current": False,
+                },
+                {
+                    "slug": "zai",
+                    "name": "z.AI",
+                    "models": ["glm-5.2", "glm-5.1", "glm-5"],
+                    "total_models": 3,
+                    "is_current": True,
+                },
+            ],
+            "current_model": "glm-5.2",
+            "current_provider": "zai",
+            "session_key": "s",
+            "on_model_selected": AsyncMock(),
+            "msg_id": 42,
+        }
+
+        query = AsyncMock()
+        query.data = "mpg:zai"
+        query.message = MagicMock()
+        query.message.chat_id = 12345
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+
+        await adapter._handle_model_picker_callback(query, "mpg:zai", "12345")
+
+        model_ids = {
+            entry["id"] for entry in adapter._model_picker_state["12345"]["model_list"]
+        }
+        assert model_ids == {"glm-5.2", "glm-5.1", "glm-5"}
+        assert "qwen38-27b-crack-q8" not in model_ids
