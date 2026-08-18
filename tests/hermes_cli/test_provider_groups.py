@@ -10,6 +10,7 @@ from hermes_cli.models import (
     CANONICAL_PROVIDERS,
     PROVIDER_GROUPS,
     group_providers,
+    local_loopback_provider_slugs,
     provider_group_for_slug,
 )
 
@@ -49,9 +50,44 @@ def test_multi_member_group_folds_to_one_row():
     assert row["description"]
 
 
+def test_loopback_providers_are_one_top_level_folder(tmp_path, monkeypatch):
+    (tmp_path / "config.yaml").write_text(
+        "providers:\n"
+        "  qwen38-27b-crack-q8:\n"
+        "    name: Qwen 3.8 27B CRACK\n"
+        "    base_url: http://127.0.0.1:8187/v1\n"
+        "    model: qwen38-27b-crack-q8\n"
+        "  cloud:\n"
+        "    name: Cloud\n"
+        "    base_url: https://api.example.com/v1\n"
+    )
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    assert local_loopback_provider_slugs() == ["custom:qwen38-27b-crack-q8"]
+    rows = group_providers(["cloud", "custom:qwen38-27b-crack-q8"])
+    assert rows[-1] == {
+        "kind": "group",
+        "group_id": "local",
+        "label": "Local",
+        "description": "Local models on this Mac",
+        "members": ["custom:qwen38-27b-crack-q8"],
+    }
+    assert provider_group_for_slug("custom:qwen38-27b-crack-q8") == "local"
 
 
-
-
+def test_curated_folder_order(tmp_path, monkeypatch):
+    (tmp_path / "config.yaml").write_text(
+        "providers:\n"
+        "  qwen38-27b-crack-q8:\n"
+        "    base_url: http://127.0.0.1:8187/v1\n"
+    )
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    rows = group_providers([
+        "moa", "openai-codex", "xai", "zai", "kimi-coding", "minimax",
+        "deepseek", "deepseek-v4-pro", "custom:qwen38-27b-crack-q8",
+    ])
+    assert [row["group_id"] for row in rows] == [
+        "moa", "openai", "xai", "zai", "moonshot", "minimax", "deepseek", "local"
+    ]
 
 

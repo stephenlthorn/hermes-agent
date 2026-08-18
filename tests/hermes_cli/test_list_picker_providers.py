@@ -94,6 +94,19 @@ def test_passthrough_kwargs_to_base(monkeypatch):
 
 
 
+def test_deduplicate_model_id_provider_rows():
+    rows = model_switch._deduplicate_picker_rows([
+        _make_provider("openai-codex", models=["gpt-5.6-luna", "gpt-5.6-sol"]),
+        _make_provider("gpt-5.6-luna", models=["gpt-5.6-luna", "gpt-5.6-sol"]),
+        _make_provider("deepseek", models=["deepseek-v4-pro", "deepseek-v4-flash"]),
+        _make_provider("deepseek-v4-pro", models=["deepseek-v4-pro"]),
+        _make_provider("custom:laguna", models=["laguna-crack"]),
+    ])
+    assert [row["slug"] for row in rows] == [
+        "openai-codex", "deepseek", "custom:laguna"
+    ]
+
+
 # ---------------------------------------------------------------------------
 # list_authenticated_providers: alias/canonical de-dup for Kimi (#49439)
 # ---------------------------------------------------------------------------

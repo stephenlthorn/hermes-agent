@@ -24,6 +24,7 @@ import logging
 import os
 import re
 import time
+import urllib.parse
 from dataclasses import dataclass
 from typing import Any, List, NamedTuple, Optional
 
@@ -3136,7 +3137,16 @@ def list_authenticated_providers(
                 and (bool(api_key) or not has_explicit_models)
                 and _can_probe_custom_provider(row_is_current=_ep_is_current)
             )
-            if _discovery_allowed:
+            try:
+                _local_host = urllib.parse.urlparse(str(api_url)).hostname
+            except ValueError:
+                _local_host = None
+            _is_local_endpoint = (_local_host or "").lower() in {
+                "127.0.0.1", "localhost", "::1", "0.0.0.0"
+            }
+            # ponytail: localhost config is authoritative; probing a shared
+            # server returns the same model list for every local provider.
+            if _discovery_allowed and not _is_local_endpoint:
                 try:
                     from hermes_cli.models import cached_fetch_api_models
                     live_models = cached_fetch_api_models(
@@ -3478,7 +3488,16 @@ def list_authenticated_providers(
                 and (bool(api_key) or not grp.get("has_explicit_models"))
                 and _can_probe_custom_provider(row_is_current=_grp_is_current)
             )
-            if _discovery_allowed:
+            try:
+                _local_host = urllib.parse.urlparse(str(api_url)).hostname
+            except ValueError:
+                _local_host = None
+            _is_local_endpoint = (_local_host or "").lower() in {
+                "127.0.0.1", "localhost", "::1", "0.0.0.0"
+            }
+            # ponytail: localhost config is authoritative; probing a shared
+            # server returns the same model list for every local provider.
+            if _discovery_allowed and not _is_local_endpoint:
                 try:
                     from hermes_cli.models import cached_fetch_api_models
 
@@ -3583,6 +3602,34 @@ def _prepend_moa_picker_provider(providers: List[dict], current_provider: str = 
         return providers
 
 
+def _deduplicate_picker_rows(providers: List[dict]) -> List[dict]:
+    """Drop model-id pseudo-provider rows already covered by a real row."""
+    model_sets = {
+        str(row.get("slug", "")).strip().lower(): {
+            str(model).strip().lower()
+            for model in (row.get("models") or [])
+            if str(model).strip()
+        }
+        for row in providers
+    }
+    all_other_models = {
+        slug: set().union(
+            *(models for other_slug, models in model_sets.items() if other_slug != slug)
+        )
+        for slug in model_sets
+    }
+    return [
+        row
+        for row in providers
+        if not (
+            str(row.get("slug", "")).strip().lower()
+            in all_other_models[str(row.get("slug", "")).strip().lower()]
+            and model_sets.get(str(row.get("slug", "")).strip().lower(), set())
+            <= all_other_models[str(row.get("slug", "")).strip().lower()]
+        )
+    ]
+
+
 def list_picker_providers(
     current_provider: str = "",
     current_base_url: str = "",
@@ -3612,7 +3659,7 @@ def list_picker_providers(
     The typed ``/model <name>`` path is unaffected -- only the interactive
     picker payload is narrowed.
     """
-    from hermes_cli.models import fetch_openrouter_models
+    from hermes_cli.models import fetch_openrouter_models, provider_group_for_slug
 
     providers = list_authenticated_providers(
         current_provider=current_provider,
@@ -3626,6 +3673,7 @@ def list_picker_providers(
     )
     if include_moa:
         providers = _prepend_moa_picker_provider(providers, current_provider=current_provider)
+    providers = _deduplicate_picker_rows(providers)
 
     filtered: List[dict] = []
     for p in providers:
@@ -3643,6 +3691,9 @@ def list_picker_providers(
         has_models = bool(p.get("models"))
         is_custom_endpoint = bool(p.get("is_user_defined")) and bool(p.get("api_url"))
         if not has_models and not is_custom_endpoint:
+            continue
+        # Stephen's picker is a curated family menu, not the full provider universe.
+        if not provider_group_for_slug(slug):
             continue
         filtered.append(p)
 

@@ -6621,13 +6621,17 @@ class TelegramAdapter(BasePlatformAdapter):
         start = page_meta["start"]
 
         buttons: list = []
-        for i, model_id in enumerate(page_models):
-            abs_idx = start + i
-            short = model_id.split("/")[-1] if "/" in model_id else model_id
+        for i, entry in enumerate(page_models):
+            if isinstance(entry, dict):
+                model_id = str(entry.get("id") or "")
+                short = str(entry.get("label") or model_id)
+            else:
+                model_id = str(entry)
+                short = model_id.split("/")[-1] if "/" in model_id else model_id
             if len(short) > 38:
                 short = short[:35] + "..."
             buttons.append(
-                InlineKeyboardButton(short, callback_data=f"mm:{abs_idx}")
+                InlineKeyboardButton(short, callback_data=f"mm:{start + i}")
             )
 
         rows = [buttons[i : i + 2] for i in range(0, len(buttons), 2)]
@@ -6782,8 +6786,13 @@ class TelegramAdapter(BasePlatformAdapter):
                 await query.answer(text="Invalid model index.")
                 return
 
-            model_id = model_list[idx]
-            provider_slug = state.get("selected_provider", "")
+            selection = model_list[idx]
+            if isinstance(selection, dict):
+                model_id = str(selection.get("id") or "")
+                provider_slug = str(selection.get("provider") or "")
+            else:
+                model_id = str(selection)
+                provider_slug = state.get("selected_provider", "")
             callback = state.get("on_model_selected")
 
             if not callback:
@@ -6831,8 +6840,13 @@ class TelegramAdapter(BasePlatformAdapter):
                 await query.answer(text="Invalid model index.")
                 return
 
-            model_id = model_list[idx]
-            provider_slug = state.get("selected_provider", "")
+            selection = model_list[idx]
+            if isinstance(selection, dict):
+                model_id = str(selection.get("id") or "")
+                provider_slug = str(selection.get("provider") or "")
+            else:
+                model_id = str(selection)
+                provider_slug = state.get("selected_provider", "")
             callback = state.get("on_model_selected")
 
             if not callback:
@@ -6909,6 +6923,70 @@ class TelegramAdapter(BasePlatformAdapter):
                 _label, _desc, member_slugs = PROVIDER_GROUPS.get(group_id, ("", "", []))
             except Exception:
                 _label, member_slugs = "", []
+
+            if group_id in {"moa", "openai", "xai", "zai", "moonshot", "minimax", "deepseek", "local"}:
+                # Each curated family is a flat model folder; Local is not special here.
+                try:
+                    from hermes_cli.models import group_providers
+                    local_row = next(
+                        (
+                            row
+                            for row in group_providers(
+                                [p.get("slug") for p in state["providers"]]
+                            )
+                            if row.get("group_id") == "local"
+                        ),
+                        None,
+                    )
+                except Exception:
+                    local_row = None
+
+                by_slug = {p["slug"]: p for p in state["providers"]}
+                members = [
+                    by_slug[m]
+                    for m in (local_row or {}).get("members", [])
+                    if m in by_slug
+                ]
+                family_label = str((local_row or {}).get("label") or group_id)
+                seen_ids: set[str] = set()
+                model_entries: list[dict[str, str]] = []
+                for provider in members:
+                    provider_label = str(provider.get("name") or provider.get("slug") or "")
+                    for raw_model_id in provider.get("models") or []:
+                        model_id = str(raw_model_id)
+                        if not model_id or model_id in seen_ids:
+                            continue
+                        seen_ids.add(model_id)
+                        model_entries.append(
+                            {
+                                "id": model_id,
+                                "provider": str(provider.get("slug") or ""),
+                                "label": provider_label if group_id == "local" else model_id,
+                            }
+                        )
+
+                if not model_entries:
+                    await query.answer(text=f"{family_label} has no models.")
+                    return
+
+                state["selected_provider"] = ""
+                state["selected_provider_name"] = family_label
+                state["model_list"] = model_entries
+                state["model_page"] = 0
+                keyboard, page_info = self._build_model_keyboard(model_entries, 0)
+                await query.edit_message_text(
+                    text=self.format_message(
+                        (
+                            "⚙ *Model Configuration*\n\n"
+                            f"Provider family: *{family_label}*"
+                            f"{page_info}\nSelect a model:"
+                        )
+                    ),
+                    parse_mode=ParseMode.MARKDOWN_V2,
+                    reply_markup=keyboard,
+                )
+                await query.answer()
+                return
 
             by_slug = {p["slug"]: p for p in state["providers"]}
             members = [by_slug[m] for m in member_slugs if m in by_slug]

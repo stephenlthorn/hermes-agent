@@ -98,4 +98,49 @@ class TestTelegramModelPicker:
         assert "provider\\_one" in edit_kwargs["text"]
         assert "`model_1`" in edit_kwargs["text"]
 
+    @pytest.mark.asyncio
+    async def test_local_folder_drills_directly_to_named_models(self, tmp_path, monkeypatch):
+        (tmp_path / "config.yaml").write_text(
+            "providers:\n"
+            "  qwen38-27b-crack-q8:\n"
+            "    name: Qwen 3.8 27B CRACK\n"
+            "    base_url: http://127.0.0.1:8187/v1\n"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        adapter = _make_adapter()
+        adapter._model_picker_state["12345"] = {
+            "providers": [
+                {
+                    "slug": "custom:qwen38-27b-crack-q8",
+                    "name": "Qwen 3.8 27B CRACK",
+                    "models": ["qwen38-27b-crack-q8"],
+                    "total_models": 1,
+                    "is_current": True,
+                }
+            ],
+            "current_model": "qwen38-27b-crack-q8",
+            "current_provider": "custom:qwen38-27b-crack-q8",
+            "session_key": "s",
+            "on_model_selected": AsyncMock(),
+            "msg_id": 42,
+        }
 
+        query = AsyncMock()
+        query.data = "mpg:local"
+        query.message = MagicMock()
+        query.message.chat_id = 12345
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+
+        await adapter._handle_model_picker_callback(query, "mpg:local", "12345")
+
+        edit_kwargs = query.edit_message_text.call_args[1]
+        assert "Local" in edit_kwargs["text"]
+        assert adapter._model_picker_state["12345"]["selected_provider"] == ""
+        assert adapter._model_picker_state["12345"]["model_list"] == [
+            {
+                "id": "qwen38-27b-crack-q8",
+                "provider": "custom:qwen38-27b-crack-q8",
+                "label": "Qwen 3.8 27B CRACK",
+            }
+        ]

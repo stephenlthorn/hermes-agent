@@ -3746,10 +3746,13 @@ def select_provider_and_model(args=None):
         _PROVIDER_LABELS,
         _PROVIDER_ALIASES,
         group_providers,
+        local_loopback_provider_slugs,
         provider_group_for_slug,
     )
 
     provider_labels = dict(_PROVIDER_LABELS)  # derive from canonical list
+    for _custom_slug, _custom_info in _custom_provider_map.items():
+        provider_labels[_custom_slug] = _custom_info.get("name") or _custom_slug
     if active and active in _custom_provider_map:
         active_label = _custom_provider_map[active]["name"]
     else:
@@ -3791,6 +3794,11 @@ def select_provider_and_model(args=None):
         ]
     else:
         _visible_slugs = [p.slug for p in CANONICAL_PROVIDERS]
+    # Keep configured loopback providers in the same top-level Local server folder
+    # even though they are not canonical cloud providers.
+    for _local_slug in local_loopback_provider_slugs():
+        if _local_slug not in _visible_slugs:
+            _visible_slugs.append(_local_slug)
     grouped_rows = group_providers(_visible_slugs)
 
     # The group/slug that should be pre-selected: the active provider's group

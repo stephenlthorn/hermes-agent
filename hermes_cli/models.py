@@ -1239,25 +1239,106 @@ _PROVIDER_LABELS["custom"] = "Custom endpoint"  # special case: not a named prov
 # Member order is the order shown inside the group submenu.
 # ---------------------------------------------------------------------------
 PROVIDER_GROUPS: dict[str, tuple[str, str, list[str]]] = {
-    "kimi":     ("Kimi / Moonshot", "Coding Plan, Moonshot global & China endpoints", ["kimi-coding", "kimi-coding-cn"]),
-    "minimax":  ("MiniMax",         "Global, OAuth Coding Plan & China endpoints",     ["minimax", "minimax-oauth", "minimax-cn"]),
-    "xai":      ("xAI Grok",        "Direct API or SuperGrok / Premium+ OAuth",        ["xai", "xai-oauth"]),
-    "google":   ("Google Gemini",   "Google AI Studio (API key)",                     ["gemini"]),
-    "openai":   ("OpenAI",          "ChatGPT/Codex subscription or direct OpenAI API", ["openai-codex", "openai-api"]),
-    "qwen":     ("Qwen",            "Qwen Cloud / DashScope, Coding Plan & Qwen CLI OAuth", ["alibaba", "alibaba-coding-plan", "qwen-oauth"]),
-    "opencode": ("OpenCode",        "Zen pay-as-you-go or Go subscription",            ["opencode-zen", "opencode-go"]),
-    "copilot":  ("GitHub Copilot",  "GitHub token API or copilot --acp process",       ["copilot", "copilot-acp"]),
+    "moa":       ("MOA",       "Mixture of Agents configurations",                    ["moa"]),
+    "openai":    ("OpenAI",    "ChatGPT / Codex subscription models",                ["openai-codex"]),
+    "xai":       ("xAI",       "xAI models",                                         ["xai", "xai-oauth"]),
+    "zai":       ("z.AI",      "z.AI / GLM models",                                  ["zai"]),
+    "moonshot":  ("Moonshot",  "Kimi / Moonshot models",                             ["kimi-coding", "kimi-coding-cn"]),
+    "minimax":   ("Minimax",   "Minimax models, including its media models",         ["minimax", "minimax-oauth", "minimax-cn"]),
+    "deepseek":  ("DeepSeek",  "DeepSeek V4 Pro and Flash models",                   ["deepseek", "deepseek-v4-pro", "deepseek-v4-flash", "deepseek-v4-flash-hosted"]),
 }
+
+# Stephen wants these as folders even when only one provider is configured.
+_ALWAYS_FOLDER_GROUPS = frozenset(PROVIDER_GROUPS)
 
 # Reverse index: member slug -> group_id. Built once at import.
 _SLUG_TO_GROUP: dict[str, str] = {
     slug: gid for gid, (_label, _desc, members) in PROVIDER_GROUPS.items() for slug in members
 }
 
+_LOCAL_GROUP_ID = "local"
+_LOCAL_GROUP_LABEL = "Local"
+_LOCAL_GROUP_DESCRIPTION = "Local models on this Mac"
+_LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1", "0.0.0.0"}
+
+
+def _is_loopback_url(value: object) -> bool:
+    try:
+        host = urllib.parse.urlparse(str(value or "").strip()).hostname
+    except ValueError:
+        return False
+    return (host or "").lower() in _LOCAL_HOSTS
+
+
+def local_loopback_provider_slugs() -> list[str]:
+    """Return configured loopback provider identities for picker grouping."""
+    try:
+        import yaml
+
+        home = Path(os.environ.get("HERMES_HOME") or (Path.home() / ".hermes"))
+        cfg = yaml.safe_load((home / "config.yaml").read_text()) or {}
+    except Exception:
+        return []
+
+    slugs: list[str] = []
+
+    def add(identity: object) -> None:
+        value = str(identity or "").strip().lower().replace(" ", "-")
+        if not value:
+            return
+        slug = value if value.startswith("custom:") else f"custom:{value}"
+        if slug not in slugs:
+            slugs.append(slug)
+
+    providers = cfg.get("providers")
+    if isinstance(providers, dict):
+        for key, entry in providers.items():
+            if isinstance(entry, dict) and _is_loopback_url(
+                entry.get("base_url") or entry.get("api") or entry.get("url")
+            ):
+                add(key or entry.get("name"))
+
+    custom = cfg.get("custom_providers")
+    if isinstance(custom, list):
+        for entry in custom:
+            if isinstance(entry, dict) and _is_loopback_url(
+                entry.get("base_url") or entry.get("url") or entry.get("api")
+            ):
+                add(entry.get("name"))
+
+    return slugs
+
+
+def _is_local_slug(slug: str, configured: set[str]) -> bool:
+    normalized = str(slug or "").strip().lower()
+    return normalized in configured or f"custom:{normalized}" in configured
+
+
+def _folder_group_for_slug(slug: str, configured_local: set[str]) -> str:
+    normalized = str(slug or "").strip().lower()
+    if _is_local_slug(normalized, configured_local):
+        return _LOCAL_GROUP_ID
+    static = _SLUG_TO_GROUP.get(normalized, "")
+    if static:
+        return static
+    if normalized == "glm" or normalized.startswith(("glm-", "zai-")):
+        return "zai"
+    if normalized.startswith("gpt-"):
+        return "openai"
+    if normalized.startswith("xai-"):
+        return "xai"
+    if normalized.startswith(("kimi-", "moonshot-")):
+        return "moonshot"
+    if normalized.startswith("minimax-"):
+        return "minimax"
+    if normalized.startswith("deepseek-v4-"):
+        return "deepseek"
+    return ""
+
 
 def provider_group_for_slug(slug: str) -> str:
-    """Return the group_id a provider slug belongs to, or "" if ungrouped."""
-    return _SLUG_TO_GROUP.get(str(slug or "").strip().lower(), "")
+    """Return the folder group_id for a provider slug, or empty if hidden."""
+    return _folder_group_for_slug(str(slug or ""), set(local_loopback_provider_slugs()))
 
 
 def group_providers(slugs):
@@ -1280,43 +1361,54 @@ def group_providers(slugs):
         emitted again).
       * Member order inside a group follows ``PROVIDER_GROUPS`` declaration,
         restricted to the members actually present in ``slugs``.
-      * A group reduced to a single present member degrades to a ``single``
-        row — no pointless one-item submenu.
-      * Slugs not in any group pass through as ``single`` rows, order
-        preserved.
+      * A regular group reduced to a single present member degrades to a
+        ``single`` row — no pointless one-item submenu. The ``local`` group
+        remains a folder even with one configured loopback provider.
+      * Slugs outside the curated folder roster are omitted.
       * Duplicate slugs in the input are ignored after first sight.
     """
-    seen: set[str] = set()
-    # Which present members each group has, in declaration order.
-    group_members: dict[str, list[str]] = {}
-    for gid, (_label, _desc, members) in PROVIDER_GROUPS.items():
-        present = [m for m in members if m in set(slugs)]
-        if present:
-            group_members[gid] = present
-
-    rows = []
-    emitted_groups: set[str] = set()
+    normalized_slugs: list[str] = []
     for slug in slugs:
         s = str(slug or "").strip().lower()
-        if not s or s in seen:
+        if s and s not in normalized_slugs:
+            normalized_slugs.append(s)
+
+    configured_local = set(local_loopback_provider_slugs())
+    local_members = [s for s in normalized_slugs if _is_local_slug(s, configured_local)]
+    rows = []
+
+    # Which present members each regular group has, in input order. Prefix
+    # matching keeps upgraded DeepSeek/Minimax provider slugs in their folder.
+    group_members: dict[str, list[str]] = {}
+    for s in normalized_slugs:
+        gid = _folder_group_for_slug(s, configured_local)
+        if gid and gid != _LOCAL_GROUP_ID:
+            group_members.setdefault(gid, []).append(s)
+
+    # Render the curated folders in declaration order, never current-provider order.
+    for gid, (label, desc, _declared_members) in PROVIDER_GROUPS.items():
+        members = group_members.get(gid)
+        if not members:
             continue
-        seen.add(s)
-        gid = _SLUG_TO_GROUP.get(s, "")
-        if not gid:
-            rows.append({"kind": "single", "slug": s})
-            continue
-        if gid in emitted_groups:
-            continue  # already folded at the first member's position
-        emitted_groups.add(gid)
-        members = group_members.get(gid, [s])
-        if len(members) <= 1:
+        if len(members) <= 1 and gid not in _ALWAYS_FOLDER_GROUPS:
             rows.append({"kind": "single", "slug": members[0]})
         else:
-            label, desc, _ = PROVIDER_GROUPS[gid]
             rows.append(
                 {"kind": "group", "group_id": gid, "label": label,
                  "description": desc, "members": list(members)}
             )
+
+    if local_members:
+        # ponytail: keep the local folder last and preserve it with one member.
+        rows.append(
+            {
+                "kind": "group",
+                "group_id": _LOCAL_GROUP_ID,
+                "label": _LOCAL_GROUP_LABEL,
+                "description": _LOCAL_GROUP_DESCRIPTION,
+                "members": local_members,
+            }
+        )
     return rows
 
 

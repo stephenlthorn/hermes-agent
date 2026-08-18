@@ -184,6 +184,7 @@ def build_models_payload(
       any surface a human is choosing from, not for programmatic resolution.
     """
     from hermes_cli.model_switch import list_authenticated_providers
+    from hermes_cli.models import provider_group_for_slug
 
     rows = list_authenticated_providers(
         current_provider=ctx.current_provider,
@@ -262,6 +263,11 @@ def build_models_payload(
 
     if include_unconfigured:
         rows = list(rows) + [r for r in _append_unconfigured_rows(rows, ctx) if str(r.get("slug", "")).lower() != "moa"]
+    if picker_hints or explicit_only:
+        rows = [
+            row for row in rows
+            if provider_group_for_slug(str(row.get("slug", "")))
+        ]
     if picker_hints:
         _apply_picker_hints(rows)
     if canonical_order:
