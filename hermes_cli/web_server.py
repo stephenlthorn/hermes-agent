@@ -14684,14 +14684,53 @@ def _write_profile_model(profile_dir: Path, provider: str, model: str) -> None:
     profile's config rather than the dashboard process's active profile.
     Clears any stale ``base_url`` / ``context_length`` the same way
     ``POST /api/model/set`` does, since the new model may differ.
+
+    Also mirrors the launch profile's USER-DEFINED ``providers:`` entries
+    into the target profile (Stephen, 2026-08-20). Profiles do not inherit
+    or overlay the parent config — each one is standalone — so writing a
+    ``model.provider`` naming a custom provider whose *definition* lives
+    only in the launch profile's config.yaml produced a profile that
+    referenced a provider it could not resolve. Every Bot Mode profile
+    created against a local/custom provider (e.g. a llama-server entry like
+    ``qwen38-27b-crack-q8``) failed agent init with "Unknown provider
+    '<name>'. Check 'hermes model' ..." on its very first message. Built-in
+    providers (minimax, zai, ...) resolve from the bundled registry and so
+    never surfaced this — only user-config providers did.
+
+    The whole user ``providers:`` block is mirrored, not just the pinned
+    entry: the bot's own /model picker reads its profile's providers, so
+    copying only the pinned one leaves the bot unable to switch to any of
+    the operator's other models. Existing keys in the target are never
+    overwritten — a clone's own definitions win.
     """
     from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+
+    # Read the LAUNCH profile's custom provider definitions BEFORE scoping to
+    # the target -- inside the override, load_config() returns the target
+    # profile's config, which is precisely the one missing these entries.
+    # read_user_config_raw (not load_config) so only the operator's OWN
+    # providers are mirrored, never DEFAULT_CONFIG's merged-in tree.
+    try:
+        from hermes_cli.config import read_user_config_raw
+
+        source_providers = (read_user_config_raw() or {}).get("providers") or {}
+    except Exception:
+        source_providers = {}
+    if not isinstance(source_providers, dict):
+        source_providers = {}
 
     token = set_hermes_home_override(str(profile_dir))
     try:
         provider, model = _normalize_main_model_assignment(provider, model)
         cfg = load_config()
         cfg["model"] = _apply_main_model_assignment(cfg.get("model", {}), provider, model)
+        if source_providers:
+            dst_providers = cfg.get("providers")
+            if not isinstance(dst_providers, dict):
+                dst_providers = {}
+            for key, definition in source_providers.items():
+                dst_providers.setdefault(key, definition)
+            cfg["providers"] = dst_providers
         save_config(cfg)
     finally:
         reset_hermes_home_override(token)
