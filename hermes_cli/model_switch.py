@@ -4027,8 +4027,12 @@ def list_picker_providers(
         is_custom_endpoint = bool(p.get("is_user_defined")) and bool(p.get("api_url"))
         if not has_models and not is_custom_endpoint:
             continue
-        # Stephen's picker is a curated family menu, not the full provider universe.
-        if not provider_group_for_slug(slug):
+        # Stephen's picker is a curated family menu, not the full provider
+        # universe. User-defined custom endpoints are the exception: an
+        # endpoint configured by hand is never "noise" — the curated roster
+        # governs the built-in families, not the user's own servers.
+        # (Upstream contract: test_current_custom_endpoint_passthrough_marks_current_row.)
+        if not (is_custom_endpoint or provider_group_for_slug(slug)):
             continue
         filtered.append(p)
 
