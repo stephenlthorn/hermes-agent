@@ -2850,6 +2850,24 @@ def _resolve_gateway_model_context(model: Optional[str] = None) -> _GatewayModel
         except Exception:
             config_context_length = None
 
+    # Resolution order matters: the model-keyed lookup is the most specific
+    # (it finds the entry that actually declares the model, single-model
+    # guard included), so it runs before the base_url-scoped one — whose
+    # fallback can otherwise leak a *different* provider's window onto this
+    # model (global minimax route 1M shadowing the loopback qwen entry 256K).
+    if config_context_length is None and custom_providers:
+        try:
+            from hermes_cli.config import get_custom_provider_model_context_by_model
+
+            custom_ctx = get_custom_provider_model_context_by_model(
+                model=resolved_model,
+                custom_providers=custom_providers,
+            )
+            if custom_ctx:
+                config_context_length = custom_ctx
+        except Exception:
+            pass
+
     if config_context_length is None and custom_providers and base_url:
         try:
             from hermes_cli.config import get_custom_provider_context_length
