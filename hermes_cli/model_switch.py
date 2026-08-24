@@ -1437,7 +1437,7 @@ def _resolve_named_custom_model_id(
 # Core model-switching pipeline
 # ---------------------------------------------------------------------------
 
-def switch_model(
+def _switch_model_core(
     raw_input: str,
     current_provider: str,
     current_model: str,
@@ -4037,3 +4037,122 @@ def list_picker_providers(
         filtered.append(p)
 
     return filtered
+
+
+# ---------------------------------------------------------------------------
+# Local model servers: start the selected on-box model automatically.
+#
+# The picker's "Local" folder lists every provider in ~/.hermes/local-models.yaml,
+# but selecting one only repointed the provider -- it never started the server.
+# The two local servers are mutually exclusive by design (they share Metal
+# unified memory even on different ports), so picking the inactive one left the
+# agent aimed at a dead port. This wrapper runs the same switcher script the
+# user would run by hand, so picking from the folder just works.
+# ---------------------------------------------------------------------------
+
+_LOCAL_SWITCH_TIMEOUT = int(os.environ.get("HERMES_LOCAL_MODEL_SWITCH_TIMEOUT", "900"))
+
+
+def _hermes_root() -> str:
+    """Root ~/.hermes even when HERMES_HOME points at <root>/profiles/<name>."""
+    home = os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes")
+    home = os.path.abspath(home)
+    parent = os.path.dirname(home)
+    if os.path.basename(parent) == "profiles":
+        return os.path.dirname(parent)
+    return home
+
+
+def _local_model_ids(root: str) -> dict:
+    """Map local model id -> port from the registry. Empty dict if absent."""
+    path = os.path.join(root, "local-models.yaml")
+    try:
+        import yaml as _yaml
+        with open(path) as fh:
+            reg = _yaml.safe_load(fh) or {}
+    except Exception:
+        return {}
+    out = {}
+    for m in reg.get("models") or []:
+        mid = m.get("id")
+        if mid:
+            out[str(mid)] = int(m.get("port") or 0)
+    return out
+
+
+def _port_is_listening(port: int) -> bool:
+    if not port:
+        return False
+    import socket as _socket
+    try:
+        with _socket.create_connection(("127.0.0.1", port), timeout=1.5):
+            return True
+    except Exception:
+        return False
+
+
+def ensure_local_model_server(provider_slug: str) -> str:
+    """Start the local server backing ``provider_slug`` if it is not already up.
+
+    Returns "" when nothing needed doing (not a local provider, or already
+    serving), otherwise a human-readable note. Never raises: a failure to start
+    must not turn an otherwise-successful model switch into an error.
+    """
+    if not provider_slug:
+        return ""
+    root = _hermes_root()
+    registry = _local_model_ids(root)
+    port = registry.get(provider_slug)
+    if port is None:
+        return ""  # not an on-box model
+    active_file = os.path.join(root, "state", "local-model-active.txt")
+    try:
+        with open(active_file) as fh:
+            active = fh.read().strip()
+    except Exception:
+        active = ""
+    if active == provider_slug and _port_is_listening(port):
+        return ""
+    script = os.path.join(root, "scripts", "local-model-switch.sh")
+    if not os.path.isfile(script):
+        return f"local model {provider_slug} is not running and {script} is missing"
+    import subprocess as _subprocess
+    try:
+        proc = _subprocess.run(
+            ["/bin/bash", script, provider_slug],
+            capture_output=True, text=True, timeout=_LOCAL_SWITCH_TIMEOUT,
+        )
+    except _subprocess.TimeoutExpired:
+        return f"timed out after {_LOCAL_SWITCH_TIMEOUT}s starting {provider_slug}"
+    except Exception as exc:
+        return f"could not start {provider_slug}: {exc}"
+    if proc.returncode != 0:
+        tail = (proc.stderr or proc.stdout or "").strip().splitlines()
+        return f"failed to start {provider_slug}: {tail[-1] if tail else 'unknown error'}"
+    if not _port_is_listening(port):
+        return f"switcher reported success but nothing is listening on port {port}"
+    return f"started local model {provider_slug} on port {port}"
+
+
+def switch_model(*args, **kwargs) -> ModelSwitchResult:
+    """``_switch_model_core`` plus automatic start of on-box model servers."""
+    result = _switch_model_core(*args, **kwargs)
+    try:
+        if not getattr(result, "success", False):
+            return result
+        note = ensure_local_model_server(getattr(result, "target_provider", "") or "")
+    except Exception:
+        logger.debug("local model autostart failed", exc_info=True)
+        return result
+    if not note:
+        return result
+    if note.startswith("started local model"):
+        logger.info("model switch: %s", note)
+        return result
+    existing = getattr(result, "warning_message", "") or ""
+    merged = (existing + "\n" if existing else "") + note
+    try:
+        import dataclasses as _dc
+        return _dc.replace(result, warning_message=merged)
+    except Exception:
+        return result
