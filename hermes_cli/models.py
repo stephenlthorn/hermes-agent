@@ -1299,6 +1299,7 @@ _PROVIDER_LABELS["custom"] = "Custom endpoint"  # special case: not a named prov
 # Member order is the order shown inside the group submenu.
 # ---------------------------------------------------------------------------
 PROVIDER_GROUPS: dict[str, tuple[str, str, list[str]]] = {
+    "local":     ("Local",     "Local models served on this Mac",                    ["qwen38-27b-crack-q8", "superqwen38-27b-abl-mlx4"]),
     "moa":       ("MOA",       "Mixture of Agents configurations",                    ["moa"]),
     "openai":    ("OpenAI",    "ChatGPT / Codex subscription models",                 ["openai-codex", "openai-api"]),
     "xai":       ("xAI",       "xAI models",                                          ["xai", "xai-oauth"]),
