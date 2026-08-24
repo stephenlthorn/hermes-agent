@@ -6764,7 +6764,14 @@ def validate_requested_model(
     # Try probing with correct auth; if it fails, accept with a warning.
     if api_mode == "anthropic_messages":
         api_models = fetch_api_models(api_key, base_url, api_mode=api_mode)
-        if api_models is not None:
+        # An EMPTY listing is not evidence of absence. mlx_vlm.server never
+        # populates /v1/models -- not even with --model preloaded and after a
+        # successful completion -- so `[]` would reject a model that is running
+        # and serving fine. Treat empty as "no information" and fall through to
+        # the couldn't-reach-API path (soft accept + warn), which is what an
+        # uninformative listing actually means. Non-empty listings stay
+        # authoritative exactly as before.
+        if api_models:
             if requested_for_lookup in set(api_models):
                 return {
                     "accepted": True,
@@ -6798,7 +6805,9 @@ def validate_requested_model(
     # Probe the live API to check if the model actually exists
     api_models = fetch_api_models(api_key, base_url)
 
-    if api_models is not None:
+    # See the note above: an empty /v1/models listing is uninformative, not a
+    # denial. Local MLX servers return [] while serving normally.
+    if api_models:
         # Gemini's OpenAI-compat /v1beta/openai/models endpoint returns IDs
         # prefixed with "models/" (e.g. "models/gemini-2.5-flash") — native
         # Gemini-API convention.  Our curated list and user input both use
@@ -6877,6 +6886,43 @@ def validate_requested_model(
             "message": (
                 f"Model `{requested}` was not found in this provider's model listing."
                 f"{suggestion_text}"
+            ),
+        }
+
+    # An EMPTY (as opposed to unreachable) listing: the server answered, it just
+    # does not advertise anything. mlx_vlm.server behaves this way permanently —
+    # even with --model preloaded and after a successful completion. Falling
+    # through to the unreachable path below would tell the user we "could not
+    # reach the API", which is false and alarming for a model that is running.
+    # When the provider declares the model in its own `models:` allowlist, that
+    # declaration is the better evidence, so accept quietly.
+    if api_models == []:
+        declared = set()
+        try:
+            from hermes_cli.config import read_user_config_raw
+
+            entry = ((read_user_config_raw() or {}).get("providers") or {}).get(
+                normalized
+            ) or {}
+            declared = set((entry.get("models") or {}).keys())
+            if entry.get("model"):
+                declared.add(str(entry["model"]))
+        except Exception:
+            declared = set()
+        if requested in declared or requested_for_lookup in {d.lower() for d in declared}:
+            return {
+                "accepted": True,
+                "persist": True,
+                "recognized": True,
+                "message": None,
+            }
+        return {
+            "accepted": True,
+            "persist": True,
+            "recognized": False,
+            "message": (
+                f"Note: `{normalized}` does not advertise a model listing, so "
+                f"`{requested}` could not be confirmed — accepted as configured."
             ),
         }
 

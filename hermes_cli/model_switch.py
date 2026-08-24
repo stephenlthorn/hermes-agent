@@ -4091,6 +4091,35 @@ def _port_is_listening(port: int) -> bool:
         return False
 
 
+def _http_ready(port: int, deadline_seconds: int = 90) -> bool:
+    """Wait until the server actually ANSWERS /v1/models, not merely accepts a socket.
+
+    An open TCP port is not readiness: mlx_vlm.server binds early and only then
+    loads ~15 GB of weights, so the switcher's port check can return while HTTP
+    is still dead. The caller validates the model right after this returns, and
+    that probe would fail with "could not reach the API to validate" on an
+    otherwise perfect switch. Any HTTP status counts -- an empty listing is a
+    valid answer, we only need the app to be serving.
+    """
+    if not port:
+        return False
+    import time as _time
+    import urllib.error as _urlerror
+    import urllib.request as _urlrequest
+
+    url = f"http://127.0.0.1:{port}/v1/models"
+    end = _time.monotonic() + deadline_seconds
+    while _time.monotonic() < end:
+        try:
+            _urlrequest.urlopen(url, timeout=3)
+            return True
+        except _urlerror.HTTPError:
+            return True  # served a response, just not a 2xx
+        except Exception:
+            _time.sleep(1.0)
+    return False
+
+
 def ensure_local_model_server(provider_slug: str) -> str:
     """Start the local server backing ``provider_slug`` if it is not already up.
 
@@ -4111,7 +4140,7 @@ def ensure_local_model_server(provider_slug: str) -> str:
             active = fh.read().strip()
     except Exception:
         active = ""
-    if active == provider_slug and _port_is_listening(port):
+    if active == provider_slug and _port_is_listening(port) and _http_ready(port, 5):
         return ""
     script = os.path.join(root, "scripts", "local-model-switch.sh")
     if not os.path.isfile(script):
@@ -4131,11 +4160,54 @@ def ensure_local_model_server(provider_slug: str) -> str:
         return f"failed to start {provider_slug}: {tail[-1] if tail else 'unknown error'}"
     if not _port_is_listening(port):
         return f"switcher reported success but nothing is listening on port {port}"
+    if not _http_ready(port):
+        return f"{provider_slug} is listening on {port} but did not answer /v1/models in time"
     return f"started local model {provider_slug} on port {port}"
+
+
+def _preflight_local_target(args, kwargs) -> str:
+    """Best-effort: the local model id this switch is aiming at, before resolution.
+
+    Starting the server BEFORE _switch_model_core runs matters: the core probes
+    the provider's /v1/models to validate the requested name, and a probe against
+    a not-yet-started server produces a "could not reach the API to validate"
+    warning on an otherwise perfect switch. We only need the id, and for on-box
+    models the provider slug IS the registry id, so an explicit provider or a
+    bare raw_input is enough to identify it. Anything we cannot match is left to
+    the post-switch check.
+    """
+    candidates = []
+    explicit = kwargs.get("explicit_provider")
+    if explicit:
+        candidates.append(str(explicit).strip())
+    raw = kwargs.get("raw_input")
+    if raw is None and args:
+        raw = args[0]
+    if raw:
+        first = str(raw).strip().split()
+        if first:
+            candidates.append(first[0])
+    try:
+        registry = _local_model_ids(_hermes_root())
+    except Exception:
+        return ""
+    for cand in candidates:
+        if cand in registry:
+            return cand
+    return ""
 
 
 def switch_model(*args, **kwargs) -> ModelSwitchResult:
     """``_switch_model_core`` plus automatic start of on-box model servers."""
+    preflight_note = ""
+    try:
+        target = _preflight_local_target(args, kwargs)
+        if target:
+            preflight_note = ensure_local_model_server(target)
+    except Exception:
+        logger.debug("local model preflight failed", exc_info=True)
+    if preflight_note.startswith("started local model"):
+        logger.info("model switch preflight: %s", preflight_note)
     result = _switch_model_core(*args, **kwargs)
     try:
         if not getattr(result, "success", False):
