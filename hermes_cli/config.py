@@ -1805,11 +1805,14 @@ def get_custom_provider_context_length(
     custom_providers: Optional[List[Dict[str, Any]]] = None,
     config: Optional[Dict[str, Any]] = None,
 ) -> Optional[int]:
-    """Look up a per-model ``context_length`` override from ``custom_providers``.
+    """Look up a ``context_length`` override from ``custom_providers``.
 
     Matches any entry whose normalized route identity equals ``base_url`` and
-    returns ``custom_providers[i].models.<model>.context_length`` if present and
-    valid.  Returns ``None`` when no override applies.
+    returns ``custom_providers[i].models.<model>.context_length`` if present
+    and valid. When the entry is single-model shaped (local llama.cpp / LM
+    Studio servers, custom proxies — window declared at the entry level, not
+    per-model), the entry-level ``context_length`` is the fallback. Returns
+    ``None`` when no override applies.
 
     This is the single source of truth for custom-provider context overrides,
     used by:
@@ -1846,13 +1849,85 @@ def get_custom_provider_context_length(
         entry_url = normalize_route_base_url(entry.get("base_url"))
         if not entry_url or entry_url != target_url:
             continue
+        # Per-model ``context_length`` is the authority. The entry-level value
+        # is the fallback — but only for single-model endpoints (local
+        # llama.cpp / LM Studio servers, custom proxies), which declare their
+        # window at the entry level, not under ``models.<id>``. Without that
+        # fallback they fall through to the hardcoded family default (qwen ->
+        # 131K for a 256K server). A multi-model catalog entry keeps its
+        # entry-level value as a *default-model* hint, so it never leaks onto
+        # a sibling model.
         models = entry.get("models")
-        if not isinstance(models, dict):
+        model_cfg = models.get(model) if isinstance(models, dict) else None
+        raw_ctx = (
+            model_cfg.get("context_length")
+            if isinstance(model_cfg, dict)
+            else None
+        )
+        single_model = (
+            not isinstance(models, dict)
+            or not models
+            or str(entry.get("model", "")).strip() == model.strip()
+        )
+        if raw_ctx is None and single_model:
+            raw_ctx = entry.get("context_length")
+        if raw_ctx is None:
             continue
-        model_cfg = models.get(model)
-        if not isinstance(model_cfg, dict):
+        try:
+            ctx = int(raw_ctx)
+        except (TypeError, ValueError):
             continue
-        raw_ctx = model_cfg.get("context_length")
+        if ctx > 0:
+            return ctx
+    return None
+
+
+def get_custom_provider_model_context_by_model(
+    model: str,
+    custom_providers: Optional[List[Dict[str, Any]]] = None,
+    config: Optional[Dict[str, Any]] = None,
+) -> Optional[int]:
+    """Look up a context window for ``model`` by *model id* across entries.
+
+    :func:`get_custom_provider_context_length` scopes to one ``base_url``. A
+    switched-to model (e.g. a local server) is often resolved against the
+    *global* provider route, whose base_url doesn't match the model's own
+    entry — so the base_url-scoped lookup misses and the hardcoded family
+    default wins. This helper keys on the model id instead: it scans every
+    entry and returns the first match where the model is declared, preferring
+    the per-model ``models.<id>.context_length`` over the entry-level value.
+
+    Returns ``None`` when no entry declares the model.
+    """
+    if not model:
+        return None
+    if custom_providers is None:
+        try:
+            custom_providers = get_compatible_custom_providers(config)
+        except Exception:
+            if config is None:
+                return None
+            raw = config.get("custom_providers")
+            custom_providers = raw if isinstance(raw, list) else []
+    if not isinstance(custom_providers, list):
+        return None
+
+    for entry in custom_providers:
+        if not isinstance(entry, dict):
+            continue
+        models = entry.get("models")
+        model_cfg = models.get(model) if isinstance(models, dict) else None
+        raw_ctx = (
+            model_cfg.get("context_length")
+            if isinstance(model_cfg, dict)
+            else None
+        )
+        # Entry-level value covers the entry's default model (the ``model:``
+        # field) — the shape single-model endpoints are written in.
+        if raw_ctx is None and (
+            str(entry.get("model", "")).strip() == model.strip()
+        ):
+            raw_ctx = entry.get("context_length")
         if raw_ctx is None:
             continue
         try:

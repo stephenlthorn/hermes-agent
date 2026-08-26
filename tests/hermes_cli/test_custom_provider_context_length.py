@@ -11,6 +11,7 @@ from unittest.mock import patch
 from hermes_cli.config import (
     get_custom_provider_context_length,
     get_custom_provider_model_capability,
+    get_custom_provider_model_context_by_model,
 )
 
 
@@ -216,3 +217,106 @@ class TestContextProbeTiers:
             assert a > b, f"tiers must strictly descend, got {a} then {b}"
         # 128K is still a tier (users relying on it probe-down get there)
         assert 128_000 in CONTEXT_PROBE_TIERS
+
+
+class TestEntryLevelContextFallback:
+    """Single-model endpoints declare their window at the entry level, not
+    under ``models.<id>``. Without the entry-level fallback a local llama.cpp
+    / LM Studio server (or custom proxy) fell through to the hardcoded family
+    default — e.g. qwen -> 131K for a 256K server."""
+
+    def test_entry_level_fallback_single_model(self):
+        # models is a single-key dict whose key != the entry's default model,
+        # OR the entry declares a bare ``model:`` — either way entry-level wins.
+        custom = [
+            {
+                "base_url": "http://127.0.0.1:8187/v1",
+                "model": "qwen38-27b-crack-q8",
+                "context_length": 262_144,
+                # single-key metadata dict, no per-model context_length
+                "models": {"qwen38-27b-crack-q8": {"timeout_seconds": 1800}},
+            }
+        ]
+        assert (
+            get_custom_provider_context_length(
+                "qwen38-27b-crack-q8", "http://127.0.0.1:8187/v1", custom
+            )
+            == 262_144
+        )
+
+    def test_per_model_beats_entry_level(self):
+        custom = [
+            {
+                "base_url": "http://x/v1",
+                "model": "m",
+                "context_length": 2222,
+                "models": {"m": {"context_length": 1111}},
+            }
+        ]
+        assert (
+            get_custom_provider_context_length("m", "http://x/v1", custom) == 1111
+        )
+
+    def test_multi_model_entry_does_not_leak_default(self):
+        # A multi-model catalog entry: entry-level is a *default-model* hint.
+        # A sibling model must NOT inherit the default model's window.
+        custom = [
+            {
+                "base_url": "http://x/v1",
+                "model": "default-model",
+                "context_length": 999_999,
+                "models": {
+                    "default-model": {},
+                    "sibling-model": {},  # no per-model ctx
+                },
+            }
+        ]
+        # sibling (not the default model) -> entry-level hint must NOT apply
+        assert (
+            get_custom_provider_context_length("sibling-model", "http://x/v1", custom)
+            is None
+        )
+        # the default model -> entry-level hint applies
+        assert (
+            get_custom_provider_context_length(
+                "default-model", "http://x/v1", custom
+            )
+            == 999_999
+        )
+
+    def test_no_context_anywhere_returns_none(self):
+        custom = [{"base_url": "http://x/v1", "model": "m"}]
+        assert get_custom_provider_context_length("m", "http://x/v1", custom) is None
+
+
+class TestModelKeyedContextLookup:
+    """get_custom_provider_model_context_by_model keys on the model id across
+    every entry — the path a switched-to model takes when it's resolved
+    against the *global* provider route (base_url mismatch)."""
+
+    def test_finds_loopback_entry_by_model_id(self):
+        custom = [
+            {"base_url": "https://api.minimax.io/anthropic", "model": "MiniMax-M3",
+             "context_length": 1_000_000, "models": {"MiniMax-M3": {}}},
+            {"base_url": "http://127.0.0.1:8187/v1", "model": "qwen38-27b-crack-q8",
+             "context_length": 262_144,
+             "models": {"qwen38-27b-crack-q8": {}}},
+        ]
+        assert (
+            get_custom_provider_model_context_by_model("qwen38-27b-crack-q8", custom)
+            == 262_144
+        )
+        assert get_custom_provider_model_context_by_model("MiniMax-M3", custom) == 1_000_000
+
+    def test_per_model_beats_entry_level(self):
+        custom = [
+            {"base_url": "http://x/v1", "model": "m", "context_length": 2222,
+             "models": {"m": {"context_length": 1111}}},
+        ]
+        assert get_custom_provider_model_context_by_model("m", custom) == 1111
+
+    def test_unknown_model_returns_none(self):
+        custom = [{"base_url": "http://x/v1", "model": "m", "context_length": 100}]
+        assert get_custom_provider_model_context_by_model("nope", custom) is None
+        assert get_custom_provider_model_context_by_model("", custom) is None
+        assert get_custom_provider_model_context_by_model("m", []) is None

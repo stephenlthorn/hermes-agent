@@ -1299,15 +1299,20 @@ _PROVIDER_LABELS["custom"] = "Custom endpoint"  # special case: not a named prov
 # Member order is the order shown inside the group submenu.
 # ---------------------------------------------------------------------------
 PROVIDER_GROUPS: dict[str, tuple[str, str, list[str]]] = {
-    "kimi":     ("Kimi / Moonshot", "Coding Plan, Moonshot global & China endpoints", ["kimi-coding", "kimi-coding-cn"]),
-    "minimax":  ("MiniMax",         "Global, OAuth Coding Plan & China endpoints",     ["minimax", "minimax-oauth", "minimax-cn"]),
-    "xai":      ("xAI Grok",        "Direct API or SuperGrok / Premium+ OAuth",        ["xai", "xai-oauth"]),
-    "google":   ("Google Gemini",   "Google AI Studio (API key)",                     ["gemini"]),
-    "openai":   ("OpenAI",          "ChatGPT/Codex subscription or direct OpenAI API", ["openai-codex", "openai-api"]),
-    "qwen":     ("Qwen",            "Qwen Cloud / DashScope, Coding Plan & Qwen CLI OAuth", ["alibaba", "alibaba-coding-plan", "qwen-oauth"]),
-    "opencode": ("OpenCode",        "Zen pay-as-you-go, Go subscription, or free tier", ["opencode-zen", "opencode-go", "opencode-free"]),
-    "copilot":  ("GitHub Copilot",  "GitHub token API or copilot --acp process",       ["copilot", "copilot-acp"]),
+    "local":     ("Local",     "Local models served on this Mac",                    ["qwen38-27b-crack-q8", "superqwen38-27b-abl-mlx4"]),
+    "moa":       ("MOA",       "Mixture of Agents configurations",                    ["moa"]),
+    "openai":    ("OpenAI",    "ChatGPT / Codex subscription models",                 ["openai-codex", "openai-api"]),
+    "xai":       ("xAI",       "xAI models",                                          ["xai", "xai-oauth"]),
+    "zai":       ("z.AI",      "z.AI / GLM models",                                   ["zai"]),
+    "moonshot":  ("Moonshot",  "Kimi / Moonshot models",                              ["kimi-coding", "kimi-coding-cn"]),
+    "minimax":   ("Minimax",   "Minimax models, including its media models",          ["minimax", "minimax-oauth", "minimax-cn"]),
+    "deepseek":  ("DeepSeek",  "DeepSeek V4 Pro and Flash models",                    ["deepseek", "deepseek-v4-pro", "deepseek-v4-flash", "deepseek-v4-flash-hosted"]),
 }
+
+# Stephen wants these as folders even when only one provider is configured
+# (upstream degrades a 1-member group to a flat row; he asked for the folder
+# to stay so the picker layout is stable). See the customizations README.
+_ALWAYS_FOLDER_GROUPS = frozenset(PROVIDER_GROUPS)
 
 # Reverse index: member slug -> group_id. Built once at import.
 _SLUG_TO_GROUP: dict[str, str] = {
@@ -1369,7 +1374,7 @@ def group_providers(slugs):
             continue  # already folded at the first member's position
         emitted_groups.add(gid)
         members = group_members.get(gid, [s])
-        if len(members) <= 1:
+        if len(members) <= 1 and gid not in _ALWAYS_FOLDER_GROUPS:
             rows.append({"kind": "single", "slug": members[0]})
         else:
             label, desc, _ = PROVIDER_GROUPS[gid]
@@ -3324,30 +3329,6 @@ def _model_in_provider_catalog(name_lower: str, providers: set[str]) -> bool:
 _AGGREGATOR_PROVIDERS = frozenset(
     {"nous", "openrouter", "ai-gateway", "copilot", "kilocode"}
 )
-
-# OpenRouter request-time routing variants (docs: guides/routing/model-variants).
-# These suffixes are per-request routing modifiers valid on ANY model id —
-# ":nitro" sorts the endpoint pool by throughput and admits priority-tier
-# endpoints, ":floor" sorts by price and admits flex-tier endpoints, ":exacto"
-# applies quality-first provider sorting, ":online" attaches the web plugin.
-# They are never separate catalog entries: /models lists only the base id.
-# NOT in this set: ":free", ":batch", ":thinking", ":extended" — those ARE
-# distinct catalog SKUs that appear in /models when they exist, so absence
-# from the listing is authoritative for them and the direct-membership check
-# above handles the valid ones.
-_OPENROUTER_VARIANT_SUFFIXES = frozenset({"nitro", "floor", "exacto", "online"})
-
-
-def _openrouter_variant_base(model_id: str) -> Optional[str]:
-    """Return the base model id when ``model_id`` carries a recognized
-    OpenRouter routing-variant suffix (e.g. ``x-ai/grok-4:nitro`` →
-    ``x-ai/grok-4``), else ``None``."""
-    base, sep, suffix = (model_id or "").rpartition(":")
-    if not sep or not base:
-        return None
-    if suffix.lower() in _OPENROUTER_VARIANT_SUFFIXES:
-        return base
-    return None
 
 # Subscription/OAuth providers whose catalogs RE-EXPOSE other vendors' models
 # would be listed here (tried only as a last resort for bare short-alias
@@ -6783,7 +6764,14 @@ def validate_requested_model(
     # Try probing with correct auth; if it fails, accept with a warning.
     if api_mode == "anthropic_messages":
         api_models = fetch_api_models(api_key, base_url, api_mode=api_mode)
-        if api_models is not None:
+        # An EMPTY listing is not evidence of absence. mlx_vlm.server never
+        # populates /v1/models -- not even with --model preloaded and after a
+        # successful completion -- so `[]` would reject a model that is running
+        # and serving fine. Treat empty as "no information" and fall through to
+        # the couldn't-reach-API path (soft accept + warn), which is what an
+        # uninformative listing actually means. Non-empty listings stay
+        # authoritative exactly as before.
+        if api_models:
             if requested_for_lookup in set(api_models):
                 return {
                     "accepted": True,
@@ -6817,7 +6805,9 @@ def validate_requested_model(
     # Probe the live API to check if the model actually exists
     api_models = fetch_api_models(api_key, base_url)
 
-    if api_models is not None:
+    # See the note above: an empty /v1/models listing is uninformative, not a
+    # denial. Local MLX servers return [] while serving normally.
+    if api_models:
         # Gemini's OpenAI-compat /v1beta/openai/models endpoint returns IDs
         # prefixed with "models/" (e.g. "models/gemini-2.5-flash") — native
         # Gemini-API convention.  Our curated list and user input both use
@@ -6830,24 +6820,6 @@ def validate_requested_model(
             ]
         if requested_for_lookup in set(api_models):
             # API confirmed the model exists
-            return {
-                "accepted": True,
-                "persist": True,
-                "recognized": True,
-                "message": None,
-            }
-        # OpenRouter routing variants (":nitro", ":floor", ...) are request-time
-        # modifiers, not catalog entries — /models lists only the base id.
-        # Validate the BASE against the listing but preserve the suffixed id,
-        # and do this BEFORE fuzzy auto-correction: get_close_matches would
-        # otherwise "correct" `model:nitro` → `model` and silently strip the
-        # user's routing opt-in.
-        _variant_base = (
-            _openrouter_variant_base(requested_for_lookup)
-            if normalized == "openrouter"
-            else None
-        )
-        if _variant_base is not None and _variant_base in set(api_models):
             return {
                 "accepted": True,
                 "persist": True,
@@ -6895,8 +6867,7 @@ def validate_requested_model(
 
                 _openai_listing_is_authoritative = is_official_openai_host(base_url)
             if not _openai_listing_is_authoritative and _model_in_provider_catalog(
-                (_variant_base or requested_for_lookup).lower(),
-                _provider_keys(normalized),
+                requested_for_lookup.lower(), _provider_keys(normalized)
             ):
                 return {
                     "accepted": True,
@@ -6915,6 +6886,43 @@ def validate_requested_model(
             "message": (
                 f"Model `{requested}` was not found in this provider's model listing."
                 f"{suggestion_text}"
+            ),
+        }
+
+    # An EMPTY (as opposed to unreachable) listing: the server answered, it just
+    # does not advertise anything. mlx_vlm.server behaves this way permanently —
+    # even with --model preloaded and after a successful completion. Falling
+    # through to the unreachable path below would tell the user we "could not
+    # reach the API", which is false and alarming for a model that is running.
+    # When the provider declares the model in its own `models:` allowlist, that
+    # declaration is the better evidence, so accept quietly.
+    if api_models == []:
+        declared = set()
+        try:
+            from hermes_cli.config import read_user_config_raw
+
+            entry = ((read_user_config_raw() or {}).get("providers") or {}).get(
+                normalized
+            ) or {}
+            declared = set((entry.get("models") or {}).keys())
+            if entry.get("model"):
+                declared.add(str(entry["model"]))
+        except Exception:
+            declared = set()
+        if requested in declared or requested_for_lookup in {d.lower() for d in declared}:
+            return {
+                "accepted": True,
+                "persist": True,
+                "recognized": True,
+                "message": None,
+            }
+        return {
+            "accepted": True,
+            "persist": True,
+            "recognized": False,
+            "message": (
+                f"Note: `{normalized}` does not advertise a model listing, so "
+                f"`{requested}` could not be confirmed — accepted as configured."
             ),
         }
 
@@ -6979,21 +6987,6 @@ def validate_requested_model(
                 "recognized": True,
                 "message": None,
             }
-        # OpenRouter routing-variant suffixes: validate the base id against
-        # the catalog, keep the suffixed id (same rule as the live-listing
-        # path above — variants never appear as catalog entries).
-        if normalized == "openrouter":
-            _cat_variant_base = _openrouter_variant_base(requested_for_lookup)
-            if (
-                _cat_variant_base is not None
-                and _cat_variant_base.lower() in catalog_lower
-            ):
-                return {
-                    "accepted": True,
-                    "persist": True,
-                    "recognized": True,
-                    "message": None,
-                }
         catalog_lower_list = list(catalog_lower.keys())
         auto = get_close_matches(
             requested_for_lookup.lower(), catalog_lower_list, n=1, cutoff=0.9

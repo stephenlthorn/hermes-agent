@@ -25,6 +25,7 @@ import logging
 import os
 import re
 import time
+import urllib.parse
 from dataclasses import dataclass
 from typing import Any, List, NamedTuple, Optional
 
@@ -1436,7 +1437,7 @@ def _resolve_named_custom_model_id(
 # Core model-switching pipeline
 # ---------------------------------------------------------------------------
 
-def switch_model(
+def _switch_model_core(
     raw_input: str,
     current_provider: str,
     current_model: str,
@@ -2164,8 +2165,7 @@ def switch_model(
     # page — and without the re-append, a stripped URL persisted to
     # model.base_url broke every later chat_completions model (glm, deepseek,
     # kimi) the same way.
-    from hermes_cli.models import opencode_provider_family as _oc_family_fn
-    if _oc_family_fn(target_provider) is not None and isinstance(base_url, str):
+    if target_provider in {"opencode-zen", "opencode-go"} and isinstance(base_url, str):
         from hermes_cli.models import normalize_opencode_base_url
         base_url = normalize_opencode_base_url(target_provider, api_mode, base_url)
 
@@ -2948,11 +2948,7 @@ def list_authenticated_providers(
 
         # Check if credentials exist
         has_creds = False
-        if getattr(overlay, "keyless", False):
-            # Keyless providers (opencode-free) are served anonymously —
-            # there is no credential to check, so everyone is authenticated.
-            has_creds = True
-        elif overlay.auth_type == "aws_sdk":
+        if overlay.auth_type == "aws_sdk":
             has_creds = _has_aws_sdk_creds_for_listing(hermes_slug)
         elif overlay.auth_type == "vertex":
             # Vertex authenticates via OAuth2 (service-account JSON / ADC),
@@ -3403,7 +3399,16 @@ def list_authenticated_providers(
                 and _can_probe_custom_provider(row_is_current=_ep_is_current)
             )
             native_catalog_empty = False
-            if _probe_live:
+            try:
+                _local_host = urllib.parse.urlparse(str(api_url)).hostname
+            except ValueError:
+                _local_host = None
+            _is_local_endpoint = (_local_host or "").lower() in {
+                "127.0.0.1", "localhost", "::1", "0.0.0.0"
+            }
+            # ponytail: localhost config is authoritative; probing a shared
+            # server returns the same model list for every local provider.
+            if _probe_live and not _is_local_endpoint:
                 try:
                     native_catalog_provider = (
                         ep_name
@@ -3792,7 +3797,16 @@ def list_authenticated_providers(
                 and _can_probe_custom_provider(row_is_current=_grp_is_current)
             )
             native_catalog_empty = False
-            if _probe_live:
+            try:
+                _local_host = urllib.parse.urlparse(str(api_url)).hostname
+            except ValueError:
+                _local_host = None
+            _is_local_endpoint = (_local_host or "").lower() in {
+                "127.0.0.1", "localhost", "::1", "0.0.0.0"
+            }
+            # ponytail: localhost config is authoritative; probing a shared
+            # server returns the same model list for every local provider.
+            if _probe_live and not _is_local_endpoint:
                 try:
                     native_catalog_provider = (
                         "ollama"
@@ -3923,6 +3937,34 @@ def _prepend_moa_picker_provider(providers: List[dict], current_provider: str = 
         return providers
 
 
+def _deduplicate_picker_rows(providers: List[dict]) -> List[dict]:
+    """Drop model-id pseudo-provider rows already covered by a real row."""
+    model_sets = {
+        str(row.get("slug", "")).strip().lower(): {
+            str(model).strip().lower()
+            for model in (row.get("models") or [])
+            if str(model).strip()
+        }
+        for row in providers
+    }
+    all_other_models = {
+        slug: set().union(
+            *(models for other_slug, models in model_sets.items() if other_slug != slug)
+        )
+        for slug in model_sets
+    }
+    return [
+        row
+        for row in providers
+        if not (
+            str(row.get("slug", "")).strip().lower()
+            in all_other_models[str(row.get("slug", "")).strip().lower()]
+            and model_sets.get(str(row.get("slug", "")).strip().lower(), set())
+            <= all_other_models[str(row.get("slug", "")).strip().lower()]
+        )
+    ]
+
+
 def list_picker_providers(
     current_provider: str = "",
     current_base_url: str = "",
@@ -3952,7 +3994,7 @@ def list_picker_providers(
     The typed ``/model <name>`` path is unaffected -- only the interactive
     picker payload is narrowed.
     """
-    from hermes_cli.models import fetch_openrouter_models
+    from hermes_cli.models import fetch_openrouter_models, provider_group_for_slug
 
     providers = list_authenticated_providers(
         current_provider=current_provider,
@@ -3966,6 +4008,7 @@ def list_picker_providers(
     )
     if include_moa:
         providers = _prepend_moa_picker_provider(providers, current_provider=current_provider)
+    providers = _deduplicate_picker_rows(providers)
 
     filtered: List[dict] = []
     for p in providers:
@@ -3984,6 +4027,204 @@ def list_picker_providers(
         is_custom_endpoint = bool(p.get("is_user_defined")) and bool(p.get("api_url"))
         if not has_models and not is_custom_endpoint:
             continue
+        # Stephen's picker is a curated family menu, not the full provider
+        # universe. User-defined custom endpoints are the exception: an
+        # endpoint configured by hand is never "noise" — the curated roster
+        # governs the built-in families, not the user's own servers.
+        # (Upstream contract: test_current_custom_endpoint_passthrough_marks_current_row.)
+        if not (is_custom_endpoint or provider_group_for_slug(slug)):
+            continue
         filtered.append(p)
 
     return filtered
+
+
+# ---------------------------------------------------------------------------
+# Local model servers: start the selected on-box model automatically.
+#
+# The picker's "Local" folder lists every provider in ~/.hermes/local-models.yaml,
+# but selecting one only repointed the provider -- it never started the server.
+# The two local servers are mutually exclusive by design (they share Metal
+# unified memory even on different ports), so picking the inactive one left the
+# agent aimed at a dead port. This wrapper runs the same switcher script the
+# user would run by hand, so picking from the folder just works.
+# ---------------------------------------------------------------------------
+
+_LOCAL_SWITCH_TIMEOUT = int(os.environ.get("HERMES_LOCAL_MODEL_SWITCH_TIMEOUT", "900"))
+
+
+def _hermes_root() -> str:
+    """Root ~/.hermes even when HERMES_HOME points at <root>/profiles/<name>."""
+    home = os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes")
+    home = os.path.abspath(home)
+    parent = os.path.dirname(home)
+    if os.path.basename(parent) == "profiles":
+        return os.path.dirname(parent)
+    return home
+
+
+def _local_model_ids(root: str) -> dict:
+    """Map local model id -> port from the registry. Empty dict if absent."""
+    path = os.path.join(root, "local-models.yaml")
+    try:
+        import yaml as _yaml
+        with open(path) as fh:
+            reg = _yaml.safe_load(fh) or {}
+    except Exception:
+        return {}
+    out = {}
+    for m in reg.get("models") or []:
+        mid = m.get("id")
+        if mid:
+            out[str(mid)] = int(m.get("port") or 0)
+    return out
+
+
+def _port_is_listening(port: int) -> bool:
+    if not port:
+        return False
+    import socket as _socket
+    try:
+        with _socket.create_connection(("127.0.0.1", port), timeout=1.5):
+            return True
+    except Exception:
+        return False
+
+
+def _http_ready(port: int, deadline_seconds: int = 90) -> bool:
+    """Wait until the server actually ANSWERS /v1/models, not merely accepts a socket.
+
+    An open TCP port is not readiness: mlx_vlm.server binds early and only then
+    loads ~15 GB of weights, so the switcher's port check can return while HTTP
+    is still dead. The caller validates the model right after this returns, and
+    that probe would fail with "could not reach the API to validate" on an
+    otherwise perfect switch. Any HTTP status counts -- an empty listing is a
+    valid answer, we only need the app to be serving.
+    """
+    if not port:
+        return False
+    import time as _time
+    import urllib.error as _urlerror
+    import urllib.request as _urlrequest
+
+    url = f"http://127.0.0.1:{port}/v1/models"
+    end = _time.monotonic() + deadline_seconds
+    while _time.monotonic() < end:
+        try:
+            _urlrequest.urlopen(url, timeout=3)
+            return True
+        except _urlerror.HTTPError:
+            return True  # served a response, just not a 2xx
+        except Exception:
+            _time.sleep(1.0)
+    return False
+
+
+def ensure_local_model_server(provider_slug: str) -> str:
+    """Start the local server backing ``provider_slug`` if it is not already up.
+
+    Returns "" when nothing needed doing (not a local provider, or already
+    serving), otherwise a human-readable note. Never raises: a failure to start
+    must not turn an otherwise-successful model switch into an error.
+    """
+    if not provider_slug:
+        return ""
+    root = _hermes_root()
+    registry = _local_model_ids(root)
+    port = registry.get(provider_slug)
+    if port is None:
+        return ""  # not an on-box model
+    active_file = os.path.join(root, "state", "local-model-active.txt")
+    try:
+        with open(active_file) as fh:
+            active = fh.read().strip()
+    except Exception:
+        active = ""
+    if active == provider_slug and _port_is_listening(port) and _http_ready(port, 5):
+        return ""
+    script = os.path.join(root, "scripts", "local-model-switch.sh")
+    if not os.path.isfile(script):
+        return f"local model {provider_slug} is not running and {script} is missing"
+    import subprocess as _subprocess
+    try:
+        proc = _subprocess.run(
+            ["/bin/bash", script, provider_slug],
+            capture_output=True, text=True, timeout=_LOCAL_SWITCH_TIMEOUT,
+        )
+    except _subprocess.TimeoutExpired:
+        return f"timed out after {_LOCAL_SWITCH_TIMEOUT}s starting {provider_slug}"
+    except Exception as exc:
+        return f"could not start {provider_slug}: {exc}"
+    if proc.returncode != 0:
+        tail = (proc.stderr or proc.stdout or "").strip().splitlines()
+        return f"failed to start {provider_slug}: {tail[-1] if tail else 'unknown error'}"
+    if not _port_is_listening(port):
+        return f"switcher reported success but nothing is listening on port {port}"
+    if not _http_ready(port):
+        return f"{provider_slug} is listening on {port} but did not answer /v1/models in time"
+    return f"started local model {provider_slug} on port {port}"
+
+
+def _preflight_local_target(args, kwargs) -> str:
+    """Best-effort: the local model id this switch is aiming at, before resolution.
+
+    Starting the server BEFORE _switch_model_core runs matters: the core probes
+    the provider's /v1/models to validate the requested name, and a probe against
+    a not-yet-started server produces a "could not reach the API to validate"
+    warning on an otherwise perfect switch. We only need the id, and for on-box
+    models the provider slug IS the registry id, so an explicit provider or a
+    bare raw_input is enough to identify it. Anything we cannot match is left to
+    the post-switch check.
+    """
+    candidates = []
+    explicit = kwargs.get("explicit_provider")
+    if explicit:
+        candidates.append(str(explicit).strip())
+    raw = kwargs.get("raw_input")
+    if raw is None and args:
+        raw = args[0]
+    if raw:
+        first = str(raw).strip().split()
+        if first:
+            candidates.append(first[0])
+    try:
+        registry = _local_model_ids(_hermes_root())
+    except Exception:
+        return ""
+    for cand in candidates:
+        if cand in registry:
+            return cand
+    return ""
+
+
+def switch_model(*args, **kwargs) -> ModelSwitchResult:
+    """``_switch_model_core`` plus automatic start of on-box model servers."""
+    preflight_note = ""
+    try:
+        target = _preflight_local_target(args, kwargs)
+        if target:
+            preflight_note = ensure_local_model_server(target)
+    except Exception:
+        logger.debug("local model preflight failed", exc_info=True)
+    if preflight_note.startswith("started local model"):
+        logger.info("model switch preflight: %s", preflight_note)
+    result = _switch_model_core(*args, **kwargs)
+    try:
+        if not getattr(result, "success", False):
+            return result
+        note = ensure_local_model_server(getattr(result, "target_provider", "") or "")
+    except Exception:
+        logger.debug("local model autostart failed", exc_info=True)
+        return result
+    if not note:
+        return result
+    if note.startswith("started local model"):
+        logger.info("model switch: %s", note)
+        return result
+    existing = getattr(result, "warning_message", "") or ""
+    merged = (existing + "\n" if existing else "") + note
+    try:
+        import dataclasses as _dc
+        return _dc.replace(result, warning_message=merged)
+    except Exception:
+        return result
