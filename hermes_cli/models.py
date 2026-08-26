@@ -1306,8 +1306,65 @@ PROVIDER_GROUPS: dict[str, tuple[str, str, list[str]]] = {
     "zai":       ("z.AI",      "z.AI / GLM models",                                   ["zai"]),
     "moonshot":  ("Moonshot",  "Kimi / Moonshot models",                              ["kimi-coding", "kimi-coding-cn"]),
     "minimax":   ("Minimax",   "Minimax models, including its media models",          ["minimax", "minimax-oauth", "minimax-cn"]),
-    "deepseek":  ("DeepSeek",  "DeepSeek V4 Pro and Flash models",                    ["deepseek", "deepseek-v4-pro", "deepseek-v4-flash", "deepseek-v4-flash-hosted"]),
+    "deepseek":  ("DeepSeek",  "DeepSeek V4 Pro and Flash models",                 ["deepseek", "deepseek-v4-pro", "deepseek-v4-flash", "deepseek-v4-flash-hosted"]),
 }
+
+# Dynamic loopback detection (restored 2026-08-26): the static map above lists
+# the slugs Stephen expects in the Local folder; this scans config for OTHER
+# loopback providers so a new local server still lands in the Local folder in
+# the CLI picker (main.py:3807 imports it). The 8/23 repair merge (f3fbb25c6b)
+# swapped the dynamic design for the static one but left the old import —
+# 'hermes model' ImportErrored until this landed.
+_LOCAL_GROUP_ID = "local"
+_LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1", "0.0.0.0"}
+
+
+def _is_loopback_url(value: object) -> bool:
+    try:
+        host = urllib.parse.urlparse(str(value or "").strip()).hostname
+    except ValueError:
+        return False
+    return (host or "").lower() in _LOCAL_HOSTS
+
+
+def local_loopback_provider_slugs() -> list[str]:
+    """Return configured loopback provider identities for picker grouping."""
+    try:
+        import yaml
+
+        home = Path(os.environ.get("HERMES_HOME") or (Path.home() / ".hermes"))
+        cfg = yaml.safe_load((home / "config.yaml").read_text()) or {}
+    except Exception:
+        return []
+
+    slugs: list[str] = []
+
+    def add(identity: object) -> None:
+        value = str(identity or "").strip().lower().replace(" ", "-")
+        if not value:
+            return
+        slug = value if value.startswith("custom:") else f"custom:{value}"
+        if slug not in slugs:
+            slugs.append(slug)
+
+    providers = cfg.get("providers")
+    if isinstance(providers, dict):
+        for key, entry in providers.items():
+            if isinstance(entry, dict) and _is_loopback_url(
+                entry.get("base_url") or entry.get("api") or entry.get("url")
+            ):
+                add(key or entry.get("name"))
+
+    custom = cfg.get("custom_providers")
+    if isinstance(custom, list):
+        for entry in custom:
+            if isinstance(entry, dict) and _is_loopback_url(
+                entry.get("base_url") or entry.get("url") or entry.get("api")
+            ):
+                add(entry.get("name"))
+
+    return slugs
+
 
 # Stephen wants these as folders even when only one provider is configured
 # (upstream degrades a 1-member group to a flat row; he asked for the folder
