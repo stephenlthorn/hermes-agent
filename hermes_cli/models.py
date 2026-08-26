@@ -1316,6 +1316,8 @@ PROVIDER_GROUPS: dict[str, tuple[str, str, list[str]]] = {
 # swapped the dynamic design for the static one but left the old import —
 # 'hermes model' ImportErrored until this landed.
 _LOCAL_GROUP_ID = "local"
+_LOCAL_GROUP_LABEL = "Local"
+_LOCAL_GROUP_DESCRIPTION = "Local models on this Mac"
 _LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1", "0.0.0.0"}
 
 
@@ -1366,6 +1368,33 @@ def local_loopback_provider_slugs() -> list[str]:
     return slugs
 
 
+def _is_local_slug(slug: str, configured: set[str]) -> bool:
+    normalized = str(slug or "").strip().lower()
+    return normalized in configured or f"custom:{normalized}" in configured
+
+
+def _folder_group_for_slug(slug: str, configured_local: set[str]) -> str:
+    normalized = str(slug or "").strip().lower()
+    if _is_local_slug(normalized, configured_local):
+        return _LOCAL_GROUP_ID
+    static = _SLUG_TO_GROUP.get(normalized, "")
+    if static:
+        return static
+    if normalized == "glm" or normalized.startswith(("glm-", "zai-")):
+        return "zai"
+    if normalized.startswith("gpt-"):
+        return "openai"
+    if normalized.startswith("xai-"):
+        return "xai"
+    if normalized.startswith(("kimi-", "moonshot-")):
+        return "moonshot"
+    if normalized.startswith("minimax-"):
+        return "minimax"
+    if normalized.startswith("deepseek-v4-"):
+        return "deepseek"
+    return ""
+
+
 # Stephen wants these as folders even when only one provider is configured
 # (upstream degrades a 1-member group to a flat row; he asked for the folder
 # to stay so the picker layout is stable). See the customizations README.
@@ -1378,8 +1407,8 @@ _SLUG_TO_GROUP: dict[str, str] = {
 
 
 def provider_group_for_slug(slug: str) -> str:
-    """Return the group_id a provider slug belongs to, or "" if ungrouped."""
-    return _SLUG_TO_GROUP.get(str(slug or "").strip().lower(), "")
+    """Return the folder group_id for a provider slug, or empty if hidden."""
+    return _folder_group_for_slug(str(slug or ""), set(local_loopback_provider_slugs()))
 
 
 def group_providers(slugs):
@@ -1402,43 +1431,54 @@ def group_providers(slugs):
         emitted again).
       * Member order inside a group follows ``PROVIDER_GROUPS`` declaration,
         restricted to the members actually present in ``slugs``.
-      * A group reduced to a single present member degrades to a ``single``
-        row — no pointless one-item submenu.
-      * Slugs not in any group pass through as ``single`` rows, order
-        preserved.
+      * A regular group reduced to a single present member degrades to a
+        ``single`` row — no pointless one-item submenu. The ``local`` group
+        remains a folder even with one configured loopback provider.
+      * Slugs outside the curated folder roster are omitted.
       * Duplicate slugs in the input are ignored after first sight.
     """
-    seen: set[str] = set()
-    # Which present members each group has, in declaration order.
-    group_members: dict[str, list[str]] = {}
-    for gid, (_label, _desc, members) in PROVIDER_GROUPS.items():
-        present = [m for m in members if m in set(slugs)]
-        if present:
-            group_members[gid] = present
-
-    rows = []
-    emitted_groups: set[str] = set()
+    normalized_slugs: list[str] = []
     for slug in slugs:
         s = str(slug or "").strip().lower()
-        if not s or s in seen:
+        if s and s not in normalized_slugs:
+            normalized_slugs.append(s)
+
+    configured_local = set(local_loopback_provider_slugs())
+    local_members = [s for s in normalized_slugs if _is_local_slug(s, configured_local)]
+    rows = []
+
+    # Which present members each regular group has, in input order. Prefix
+    # matching keeps upgraded DeepSeek/Minimax provider slugs in their folder.
+    group_members: dict[str, list[str]] = {}
+    for s in normalized_slugs:
+        gid = _folder_group_for_slug(s, configured_local)
+        if gid and gid != _LOCAL_GROUP_ID:
+            group_members.setdefault(gid, []).append(s)
+
+    # Render the curated folders in declaration order, never current-provider order.
+    for gid, (label, desc, _declared_members) in PROVIDER_GROUPS.items():
+        members = group_members.get(gid)
+        if not members:
             continue
-        seen.add(s)
-        gid = _SLUG_TO_GROUP.get(s, "")
-        if not gid:
-            rows.append({"kind": "single", "slug": s})
-            continue
-        if gid in emitted_groups:
-            continue  # already folded at the first member's position
-        emitted_groups.add(gid)
-        members = group_members.get(gid, [s])
         if len(members) <= 1 and gid not in _ALWAYS_FOLDER_GROUPS:
             rows.append({"kind": "single", "slug": members[0]})
         else:
-            label, desc, _ = PROVIDER_GROUPS[gid]
             rows.append(
                 {"kind": "group", "group_id": gid, "label": label,
                  "description": desc, "members": list(members)}
             )
+
+    if local_members:
+        # ponytail: keep the local folder last and preserve it with one member.
+        rows.append(
+            {
+                "kind": "group",
+                "group_id": _LOCAL_GROUP_ID,
+                "label": _LOCAL_GROUP_LABEL,
+                "description": _LOCAL_GROUP_DESCRIPTION,
+                "members": local_members,
+            }
+        )
     return rows
 
 
