@@ -26,7 +26,7 @@ from gateway.platforms.base import (
 )
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.platforms.media_cache import ext_for_mime
-from gateway.platforms.helpers import compile_mention_patterns, spoken_mention_clips, strip_markdown
+from gateway.platforms.helpers import compile_mention_patterns, plain_emphasis_mode, spoken_mention_clips, strip_markdown
 from gateway.platforms.helpers import voice_mention_gate_enabled
 from utils import TRUTHY_STRINGS
 
@@ -142,6 +142,9 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         path = str(_extra_or_secret(extra, "webhook_path", "BLUEBUBBLES_WEBHOOK_PATH", DEFAULT_WEBHOOK_PATH))
         self.webhook_path = path if path.startswith("/") else f"/{path}"
         self.send_read_receipts = bool(extra.get("send_read_receipts", True))
+        # strip (default) | caps | unicode: how bold/italic survive iMessage's plain text.
+        self.plain_emphasis = plain_emphasis_mode(
+            extra.get("plain_emphasis") or _get_scoped_secret("BLUEBUBBLES_PLAIN_EMPHASIS", "strip"))
         _require_mention = extra.get("require_mention")
         if _require_mention is None:
             _require_mention = _get_scoped_secret("BLUEBUBBLES_REQUIRE_MENTION")
@@ -491,7 +494,8 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         return info
 
     def format_message(self, content: str) -> str:
-        return strip_markdown(content, keep_link_targets=True)  # iMessage auto-links bare URLs only
+        return strip_markdown(  # iMessage auto-links bare URLs only
+            content, keep_link_targets=True, emphasis=getattr(self, "plain_emphasis", "strip"))
 
     # --- Inbound attachment downloading ---
 

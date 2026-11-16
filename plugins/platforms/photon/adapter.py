@@ -42,7 +42,7 @@ from gateway.platforms._shared import (
 )
 from gateway.platforms.base import BasePlatformAdapter, SendResult
 from gateway.platforms.event import MessageEvent, MessageType
-from gateway.platforms.helpers import compile_mention_patterns, spoken_mention_clips, strip_markdown
+from gateway.platforms.helpers import compile_mention_patterns, plain_emphasis_mode, spoken_mention_clips, strip_markdown
 from gateway.platforms.helpers import bypasses_chat_order, chat_ordered_work, voice_mention_gate_enabled
 from gateway.platforms.helpers import MessageDeduplicator, bounded_put, cancel_task
 from gateway.platforms.send_targets import regex_stripped_parser
@@ -357,6 +357,11 @@ def _markdown_enabled() -> bool:
     return _get_scoped_secret("PHOTON_MARKDOWN", "true").strip().lower() not in {"false", "0", "no"}
 
 
+def _plain_emphasis() -> str:
+    """How bold/italic survive a plain-text send: ``PHOTON_PLAIN_EMPHASIS`` = strip (default) | caps | unicode."""
+    return plain_emphasis_mode(_get_scoped_secret("PHOTON_PLAIN_EMPHASIS", "strip"))
+
+
 # Mirrors URL_RE in plugins/platforms/photon/sidecar/send-format.mjs. Keep the
 # two in sync: the sidecar owns the builder choice, this owns the payload that
 # choice implies.
@@ -373,7 +378,7 @@ def _sidecar_payload_text(text: str, send_markdown: bool) -> str:
     """
     if send_markdown and not _SIDECAR_URL_RE.search(text or ""):
         return text
-    return strip_markdown(text, keep_link_targets=True)
+    return strip_markdown(text, keep_link_targets=True, emphasis=_plain_emphasis())
 
 
 def _url_only_candidate(text: str) -> Optional[str]:
@@ -1508,7 +1513,7 @@ class PhotonAdapter(BasePlatformAdapter):
 
     def format_message(self, content: str) -> str:
         # Markdown passes through verbatim (sidecar markdown() builder); PHOTON_MARKDOWN=false strips.
-        return content if _markdown_enabled() else strip_markdown(content, keep_link_targets=True)
+        return content if _markdown_enabled() else strip_markdown(content, keep_link_targets=True, emphasis=_plain_emphasis())
 
     @staticmethod
     def _is_retryable_error(error: Optional[str]) -> bool:

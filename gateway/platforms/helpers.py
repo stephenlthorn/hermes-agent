@@ -352,13 +352,65 @@ def _keep_link_target(match: re.Match[str]) -> str:
     return target if label == target else f"{label}\n{target}"
 
 
-def strip_markdown(text: str, *, keep_link_targets: bool = False) -> str:
+# How emphasis survives on a plain-text platform: ``strip`` drops it (the old
+# behaviour), ``caps`` upper-cases bold and headings, ``unicode`` maps bold and
+# headings to Mathematical Sans-Serif Bold and italics to Sans-Serif Italic,
+# which iMessage/SMS render as real bold/italic glyphs.
+PLAIN_EMPHASIS_MODES = ("strip", "caps", "unicode")
+_UNICODE_BOLD = str.maketrans(
+    {**{chr(0x41 + i): chr(0x1D5D4 + i) for i in range(26)},
+     **{chr(0x61 + i): chr(0x1D5EE + i) for i in range(26)},
+     **{chr(0x30 + i): chr(0x1D7EC + i) for i in range(10)}})
+_UNICODE_ITALIC = str.maketrans(
+    {**{chr(0x41 + i): chr(0x1D608 + i) for i in range(26)},
+     **{chr(0x61 + i): chr(0x1D622 + i) for i in range(26)}})
+_HEADING_RE = re.compile(r"^#{1,6}\s+(.*)$", re.MULTILINE)
+
+
+def plain_emphasis_mode(value: Any) -> str:
+    """Normalise a configured emphasis mode; anything unknown falls back to ``strip``."""
+    mode = str(value or "").strip().lower()
+    return mode if mode in PLAIN_EMPHASIS_MODES else "strip"
+
+
+def _emphasis_styler(mode: str, kind: str):
+    """``kind`` is ``bold`` or ``italic``. Spans holding a URL or code stay as typed, so links
+    remain tappable and code stays literal."""
+    if mode == "caps":
+        style = str.upper if kind == "bold" else None
+    elif mode == "unicode":
+        table = _UNICODE_BOLD if kind == "bold" else _UNICODE_ITALIC
+        style = lambda s: s.translate(table)
+    else:
+        style = None
+
+    def apply(match: re.Match[str]) -> str:
+        inner = match.group(1)
+        if style is None or "://" in inner or "`" in inner:
+            return inner
+        return style(inner)
+    return apply
+
+
+def _emphasis_rules(mode: str) -> tuple:
+    """``_STRIP_RULES`` with the emphasis and heading replacements styled for ``mode``."""
+    if mode == "strip":
+        return _STRIP_RULES
+    bold, italic = _emphasis_styler(mode, "bold"), _emphasis_styler(mode, "italic")
+    (b_star, _), (i_star, _), (b_under, _), (i_under, _), fence, code, _heading = _STRIP_RULES
+    return ((b_star, bold), (i_star, italic), (b_under, bold), (i_under, italic),
+            fence, code, (_HEADING_RE, bold))
+
+
+def strip_markdown(text: str, *, keep_link_targets: bool = False, emphasis: str = "strip") -> str:
     r"""Strip markdown formatting for plain-text platforms (SMS, iMessage, etc.).
 
     ``keep_link_targets`` rewrites ``[label](https://url)`` as ``label\nurl``
     instead of discarding the URL; pass it on platforms that auto-link bare URLs.
+    ``emphasis`` (one of ``PLAIN_EMPHASIS_MODES``) keeps bold/italic visible
+    without markdown: ``caps`` -> ``BOLD``, ``unicode`` -> ``𝗯𝗼𝗹𝗱`` / ``𝘪𝘵𝘢𝘭𝘪𝘤``.
     """
-    for pattern, repl in _STRIP_RULES:
+    for pattern, repl in _emphasis_rules(plain_emphasis_mode(emphasis)):
         text = pattern.sub(repl, text)
     text = _MD_LINK_RE.sub(_keep_link_target if keep_link_targets else r"\1", text)
     return _NEWLINE_SQUEEZE_RE.sub("\n\n", text).strip()
